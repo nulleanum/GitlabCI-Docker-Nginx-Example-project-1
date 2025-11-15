@@ -1,0 +1,16 @@
+networks:
+  nginx-net:
+    external: true
+
+services:
+  name-project:
+    build:
+      context: .
+      dockerfile: dockerfile-name
+    container_name: "container-name"
+    image: "image-name:stable"
+    env_file:
+      - ./src/app/.env
+    networks:
+      - nginx-net
+    restart: unless-stopped

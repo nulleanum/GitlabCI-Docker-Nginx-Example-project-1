@@ -1,0 +1,195 @@
+# Потенциальные обновления:
+# Перейти с docker на podman
+# Уйти с переменных на hashicor vault
+
+variables:
+  IDS: "${TEAM_LEAD_ID} ${MAIN_DEV_ID} ${MAIN_DEV_OPS_ID}" # ID пользователей телеграма
+  NOTIFICATION_COMMIT: "Имя_проекта:%20$CI_PROJECT_NAME%0AТекущая_ветка:%20$CI_COMMIT_REF_NAME%0AАвтор_коммита:%20$GITLAB_USER_NAME%0AКоммит:%20$CI_COMMIT_MESSAGE"
+  NOTIFICATION_SEND_PROJECT: "Имя_проекта:%20$CI_PROJECT_NAME%0AТекущая_ветка:%20$CI_COMMIT_REF_NAME%0AПроект_отправлен_на_адрес:%20$IP"
+  NOTIFICATION_BUILD_RUN_TG: "Имя_проекта:%20$CI_PROJECT_NAME%0AТекущая_ветка:%20$CI_COMMIT_REF_NAME%0AНазвание_стадии:%20$CI_JOB_NAME%0AСтатус этапа:%20$CI_JOB_STATUS%0AIP_адрес_сервера:%20http://$IP"
+  NOTIFICATION_BUILD_RUN_BACK: "Имя_проекта:%20$CI_PROJECT_NAME%0AТекущая_ветка:%20$CI_COMMIT_REF_NAME%0AНазвание_стадии:%20$CI_JOB_NAME%0AСтатус этапа:%20$CI_JOB_STATUS%0AIP_адрес_сервера:%20http://$IP:${PORT_APP_BACK}%0AДоменное_имя:%20${DOMAIN_NAME_BACK}"
+  NOTIFICATION_BUILD_RUN_FRONT: "Имя_проекта:%20$CI_PROJECT_NAME%0AТекущая_ветка:%20$CI_COMMIT_REF_NAME%0AНазвание_стадии:%20$CI_JOB_NAME%0AСтатус этапа:%20$CI_JOB_STATUS%0AIP_адрес_сервера:%20http://$IP:${PORT_APP}%0AДоменное_имя:%20${DOMAIN_NAME_FRONT}"
+
+stages:
+  - notification
+  - auto-test
+  - test
+  - prod
+
+.notification_script: &notification_script |
+  for id in ${IDS}; do
+    curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" -d "chat_id=${id}&disable_web_page_preview=1&text=${NOTIFICATION}"
+  done
+
+.send-project-to-server: &spts
+  before_script:
+    - echo "${SSH_PRIVATE_KEY}" | base64 -d > /root/id_rsa && chmod 700 /root/id_rsa
+    - ssh -o StrictHostKeyChecking=no -i $HOME/id_rsa -p ${PORT_SSH} root@${IP} "rm -r $HOME/${CI_PROJECT_NAME}" || true
+    - echo "${ENV_FILE}" | base64 -d > ./src/app/.env && chmod 700 ./src/app/.env
+  script:
+    - ssh -o StrictHostKeyChecking=no -i $HOME/id_rsa -p ${PORT_SSH} root@${IP} "mkdir $HOME/${CI_PROJECT_NAME}" || true
+    - shopt -s dotglob
+    - scp -o StrictHostKeyChecking=no -i $HOME/id_rsa -P ${PORT_SSH} -r ./* root@${IP}:$HOME/${CI_PROJECT_NAME}/
+    - shopt -u dotglob
+  after_script:
+    - *notification_script
+    
+.build-and-run: &bar
+  before_script:
+    - echo "${SSH_PRIVATE_KEY}" | base64 -d > /root/id_rsa && chmod 700 /root/id_rsa
+    - ssh -o StrictHostKeyChecking=no -i $HOME/id_rsa -p ${PORT_SSH} root@${IP} "docker compose -f $HOME/${CI_PROJECT_NAME}/docker-compose.yml down && docker image prune -af" || true
+  script:
+    - ssh -o StrictHostKeyChecking=no -i $HOME/id_rsa -p ${PORT_SSH} root@${IP} "docker compose -f $HOME/${CI_PROJECT_NAME}/docker-compose.yml up -d"
+  after_script:
+    - *notification_script
+
+.update-nginx-configs: &unc
+  before_script:
+    - echo "${SSH_PRIVATE_KEY}" | base64 -d > /root/id_rsa && chmod 700 /root/id_rsa
+  script:
+    - ssh -o StrictHostKeyChecking=no -i $HOME/id_rsa -p ${PORT_SSH} root@${IP} "cp $HOME/${CI_PROJECT_NAME}/src/nginx/conf.d/${NGINX_CONF_FILE} $HOME/nginx/src/nginxConfigs/conf.d/ && cp -r $HOME/${CI_PROJECT_NAME}/src/nginx/sslCert/* $HOME/nginx/src/nginxConfigs/sslCert/ && docker restart nginx"
+  after_script:
+    - *notification_script
+
+commit-message:
+  stage: notification
+  variables:
+    NOTIFICATION: $NOTIFICATION_COMMIT
+  script:
+    - *notification_script
+
+nginx:
+  stage: auto-test
+  image: nginx:latest
+  script:
+    - cp src/nginx/conf.d/* /etc/nginx/conf.d/ && nginx -t
+
+hadolint:
+  stage: auto-test
+  image: errornoyname/hadolint:1.0
+  script:
+    - hadolint dockerfile*
+
+dockle:
+  stage: auto-test
+  services:
+    - name: docker:20.10.16-dind
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - docker compose build
+  script:
+    - IMAGES=$(docker images --format "{{.Repository}}:{{.Tag}}")
+    - |
+      for is in ${IMAGES}; do
+        docker save ${is} > /tmp/image.tar
+        if dockle --input /tmp/image.tar | grep -A 50 -e FATAL -e WARN; then
+          exit 1
+        fi
+        rm -f /tmp/image.tar
+      done
+
+trivy:
+  stage: auto-test
+  image: errornoyname/trivy:1.0
+  services:
+    - name: docker:20.10.16-dind
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - docker compose build
+  script:
+    - | 
+      IMAGES=$(docker images --format "{{.Repository}}:{{.Tag}}")
+      VULNERABLE_FOUND=0
+     
+      for image in ${IMAGES}; do
+        if trivy image --severity HIGH,CRITICAL --exit-code 1 "${image}"; then
+          echo "No vulnerabilities found in $image"
+        else
+          echo "Vulnerabilities found in $image"
+          VULNERABLE_FOUND=1
+        fi
+      done
+
+      if [ $VULNERABLE_FOUND -eq 1 ]; then
+        exit 1
+      else
+        exit 0
+      fi
+  when: manual
+  allow_failure: true
+
+linting:
+  stage: auto-test
+  image: pipelinecomponents/ruff:edge
+  script:
+    - ruff check .
+
+1t-send-project-to-server:
+  stage: test
+  variables:
+    SSH_PRIVATE_KEY: $SSH_PRIVATE_KEY_TEST
+    PORT_SSH: PORT_SSH_TEST
+    IP: IP_TEST
+    ENV_FILE: ENV_FILE_TEST
+    NOTIFICATION: $NOTIFICATION_SEND_PROJECT
+  when: manual
+  <<: *spts
+
+2t-build-and-run:
+  stage: test
+  variables:
+    SSH_PRIVATE_KEY: $SSH_PRIVATE_KEY_TEST
+    PORT_SSH: PORT_SSH_TEST
+    IP: IP_TEST
+    NOTIFICATION: $NOTIFICATION_BUILD_RUN_TG
+  when: manual
+  <<: *bar
+
+3t-update-nginx-configs:
+  stage: test
+  variables:
+    SSH_PRIVATE_KEY: $SSH_PRIVATE_KEY_TEST
+    PORT_SSH: PORT_SSH_TEST
+    IP: IP_TEST
+    NGINX_CONF_FILE: name-project-nginx-test.conf
+    NOTIFICATION: $NOTIFICATION_BUILD_RUN_FRONT
+  when: manual
+  <<: *unc
+
+1p-send-project-to-server:
+  stage: prod
+  variables:
+    SSH_PRIVATE_KEY: $SSH_PRIVATE_KEY_PROD
+    PORT_SSH: PORT_SSH_PROD
+    IP: IP_PROD
+    ENV_FILE: ENV_FILE_PROD
+    NOTIFICATION: $NOTIFICATION_SEND_PROJECT
+  when: manual
+  <<: *spts
+
+2p-build-and-run:
+  stage: prod
+  variables:
+    SSH_PRIVATE_KEY: $SSH_PRIVATE_KEY_PROD
+    PORT_SSH: PORT_SSH_PROD
+    IP: IP_PROD
+    NOTIFICATION: $NOTIFICATION_BUILD_RUN_TG
+  when: manual
+  <<: *bar
+
+3p-update-nginx-configs:
+  stage: prod
+  variables:
+    SSH_PRIVATE_KEY: $SSH_PRIVATE_KEY_PROD
+    PORT_SSH: PORT_SSH_PROD
+    IP: IP_PROD
+    NGINX_CONF_FILE: name-project-nginx-prod.conf
+    NOTIFICATION: $NOTIFICATION_BUILD_RUN_FRONT
+  when: manual
+  <<: *unc

@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+LABEL author="Error-noy-name"
+RUN useradd --uid 1000 -U -ms /bin/bash newuser
+COPY ./src/app/ /home/newuser/project_name/
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install --no-install-recommends -y postgresql-client-17=17.6-0+deb13u1 \
+        libpq-dev=17.6-0+deb13u1 \
+        python3-dev=3.13.5-1 \
+        build-essential=12.12 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip3 install --no-cache-dir --upgrade pip -r /home/newuser/project_name/requirements.txt && \
+    chown -R newuser:newuser /home/newuser/project_name
+USER newuser
+WORKDIR /home/newuser/project_name
+EXPOSE 8001
+CMD ["python3", "main.py", "daemon off;"]
